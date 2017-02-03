@@ -1,0 +1,163 @@
+---
+title: "Homework2"
+output: html_document
+Kaggle Name: ttu_josh
+---
+First load all the packages required. 
+
+
+```{r}
+require(doMC)
+require(e1071)
+require(h2o) 
+require(mxnet)
+require(mlbench)
+```
+
+The next step is to use multiple processing cores. Since I am running this on a mac I use the doMC library. 
+```{r}
+registerDoMC()#mac parrallel proceessing 
+options(cores=5)#5 cores 
+getDoParWorkers()#check
+```
+
+The data is now loaded into R.
+
+```{r}
+train <- read.csv(file.choose(), header = T) # read in the train set
+test <- read.csv(file.choose(), header = T) # read in the test set 
+```
+
+I am not sure if running principle components analysis on pixel data was correct. I did it any way and gave it a shot.
+
+```{r}
+PixelTrainPca <- princomp(train[,2:785]) #run pca
+summary(PixelTrainPca) #look for total variance 80%
+TrainPCA <- data.frame(train$label, PixelTrainPca$scores[,1:43]) # make a data frame with new components and the label
+TestPCA <- predict(PixelTrainPca, test)[,1:43] # this does the same transforamtion from the train onto the test
+```
+
+Naive Bayes is a very easy and straight foreward model. I used it to know get an idea of the submission process and making sure every thing is in the correct format. I had some difficulty getting the predict to output the label with highest percentage. So I had to go the round about way and show the probability and then print the label with the highest probability. 
+
+```{r}
+NB <- naiveBayes(TrainPCA$train.label~.,data=TrainPCA) # Naive Bayes model with default hyperperameters
+pred1 <- predict(NB,as.data.frame(TestPCA), type= 'raw') #I could not get it to work without the probabilities and just return max probability. This is the long route
+colnames(pred1) = c("0","1","2","3","4","5","6","7","8","9") #name the columns (get rid of the x)
+pred1m <- colnames(pred1)[apply(pred1,1,which.max)] #This returns the name of the column of the maximum probiblity for each row
+id1=c(1:28000) # Make id vector for the ImageId column of the submission file
+Sub <- data.frame(ImageId=id1,Label=pred1m) # Make the submission dataframe
+View(Sub) # Make sure its in the correct format
+write.csv(Sub,'SubNB.csv',row.names=FALSE) # write to a csv and submit to kaggle 
+```
+
+The Naive Bayes with principle components performed decently in kaggle. The accureacy was 0.86757. This was nice, becuase the time to run was only a few seconds.
+
+In my next attempt I ran the model with out PCA just to out of curiosity to see the diffrence. It actually scored the exact same but was computationaly more expensive to run the whole data set, was still under 4 minutes. 
+
+```{r}
+NB2 <- naiveBayes(train$label~.,data=train)
+pred2 <- predict(NB2,test, type= 'raw')
+colnames(pred2) = c("0","1","2","3","4","5","6","7","8","9")
+pred2m <- colnames(pred2)[apply(pred1,1,which.max)]
+Sub2 <- data.frame(ImageId=id1,Label=pred2m)
+write.csv(Sub2,'SubNBnoPCA.csv',row.names=FALSE) # write to a csv and submit to kaggle 
+```
+
+
+For my next model I ran a deep learning in the h2o package, becuase it had a good reputation in our previous assignment. This time I knew I needed to try to optimize some of the hyperperameters. I used the h2o.grid to run a grid search. It took me a while to figure out how to do this. After looking at documentation online and correcting many errors. I finally got it to run. I only did a few hyperperamets, becuase for each hyperperameter the cartisian grid search runs a new model which is time consuming.  
+
+To run the grid search I needed to divide my training data set into two parts to make a train and a validation set. 
+
+```{r}
+traintune <- train[1:33600,]
+validation <- train[33601:42000,]
+write.csv(traintune, "traintune.csv", row.names = F)
+write.csv(validation, "validation.csv", row.names = F)
+
+h2o.init(nthreads=-1, max_mem_size="2G") #initialize h2o since it is a java based program
+
+train.tune.hex <- h2o.uploadFile(path='traintune.csv')
+validation.tune.hex <- h2o.uploadFile(path = 'validation.csv')
+```
+
+The next step is to make edit the hyperperameters. I also had to make the predictor a factor so that h2o knew it was a catigorical variable. To my limited understanding this is becuase I used the multinomil distribution. 
+```{r}
+hidden_opt=list(c(750,750),c(100,300,800))
+l1_opt =c(.0001,.00001) 
+
+hyper_params <- list(hidden=hidden_opt,l1=l1_opt)
+y<-"label"
+x<-setdiff(names(train.tune.hex),y)
+
+train.tune.hex[,y] <- as.factor(train.tune.hex[,y])
+validation.tune.hex[,y] <- as.factor(validation.tune.hex[,y])
+```
+
+I can now make the grid search. 
+
+```{r}
+GridSearch <- h2o.grid(x=x, y=y, 
+  algorithm = "deeplearning",
+  distribution="multinomial",
+  grid_id = "RGS1", 
+  training_frame= train.tune.hex,
+  validation_frame= validation.tune.hex ,
+  score_interval=2,
+  epochs=100,
+  hyper_params=hyper_params,
+  stopping_rounds=3,
+  stopping_tolerance=.05,
+  stopping_metric="misclassification"
+)
+```
+
+Hours later we can now look at the hyperperameters that performed best. We are looking for the smallest log loss. 
+
+```{r}
+summary(GridSearch)
+```
+
+If I were to do this again I would try the random grid search. 
+
+Now we use the hyperperameters that performed best in the grid search in the deep learning model. This time we load the whole training data set. 
+
+```{r}
+time<-proc.time()
+deeplearningmodel <- h2o.deeplearning(
+  x=x,
+  y=y,
+  training_frame= train.hex,
+  distribution= "multinomial",
+  activation="Rectifier",
+  hidden=c(750,750), #taken from the catesian gridsearch
+  l1=1e-4,
+  epochs=100,
+  adaptive_rate = T
+  )
+proc.time() - time
+
+```
+
+
+The next step is to predict and submit. This model performed as expected the log loss was 0.97629	. If I had a bit more time I would run a larger grid search with more hyperperameters to increase my score. 
+
+
+```{r}
+pred3<-h2o.predict(deeplearningmodel, test.hex)
+pred3df<-as.data.frame(pred3)
+id1=c(1:28000) # Make id vector for the ImageId column of the submission file
+Sub3 <- data.frame(ImageId=id1,Label=pred3df$predict) # Get everything in the correct format
+write.csv(Sub3,'SubDeepLearning.csv',row.names=FALSE) # write to a csv and submit to kaggle
+```
+
+
+The most important lesson I learned in this excercise was the grid search. Grid search and random grid search seem to be a very useful tool. I also was pleased to see PCA work very well. 
+
+
+
+
+
+
+
+
+
